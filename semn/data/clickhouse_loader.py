@@ -64,7 +64,11 @@ BAR_SCHEMA: dict[str, pl.PolarsDataType] = {
     "close": pl.Float64,
     "volume": pl.Float64,
     "vwap": pl.Float64,
+    "session_date": pl.Date,  # exchange-local (New York) date of the bar
 }
+
+#: Exchange time zone; daily bars and session dates follow its local calendar.
+EXCHANGE_TZ = "America/New_York"
 
 # Polars truncate aliases for common bar frequencies.
 _FREQ_ALIASES: dict[str, str] = {
@@ -149,7 +153,7 @@ class ClickHouseLoader:
             except ImportError as exc:
                 raise ImportError(
                     "clickhouse-connect is required for a live connection.  "
-                    "Install it with: pip install clickhouse-connect"
+                    "Install it with: pip install 'semn[clickhouse]'"
                 ) from exc
 
             self._client: ClickHouseClientProtocol = (
@@ -203,7 +207,6 @@ class ClickHouseLoader:
         # PIT: effective end is the earlier of end and pit_cutoff
         effective_end = min(end_dt, cutoff_dt)
 
-        sym_list = self._format_symbol_list(symbols)
         sql = f"""
             SELECT
                 ts,
@@ -212,12 +215,13 @@ class ClickHouseLoader:
                 size,
                 side
             FROM {self._ticks_table}
-            WHERE symbol IN ({sym_list})
+            WHERE has({{symbols:Array(String)}}, symbol)
               AND ts >= {{start:DateTime64}}
               AND ts  < {{end:DateTime64}}
             ORDER BY symbol, ts
         """
         params = {
+            "symbols": list(symbols),
             "start": start_dt.strftime("%Y-%m-%d %H:%M:%S"),
             "end": effective_end.strftime("%Y-%m-%d %H:%M:%S"),
         }
@@ -261,7 +265,9 @@ class ClickHouseLoader:
         Returns
         -------
         pl.DataFrame
-            Schema: ``ts, symbol, open, high, low, close, volume, vwap``.
+            Schema: ``ts, symbol, open, high, low, close, volume, vwap,
+            session_date``.  ``ts`` is a UTC instant inside the bar;
+            ``session_date`` is its New York local date, the key for daily data.
         """
         start_dt = _parse_dt(start)
         end_dt = _parse_dt(end)
@@ -274,7 +280,6 @@ class ClickHouseLoader:
             )
             return self.resample_ticks_to_bars(tick_df, freq)
 
-        sym_list = self._format_symbol_list(symbols)
         norm_freq = _normalise_freq(freq)
         sql = f"""
             SELECT
@@ -285,15 +290,17 @@ class ClickHouseLoader:
                 low,
                 close,
                 volume,
-                vwap
+                vwap,
+                toDate(ts, '{EXCHANGE_TZ}') AS session_date
             FROM {self._bars_table}
-            WHERE symbol IN ({sym_list})
+            WHERE has({{symbols:Array(String)}}, symbol)
               AND freq   = {{freq:String}}
               AND ts    >= {{start:DateTime64}}
               AND ts     < {{end:DateTime64}}
             ORDER BY symbol, ts
         """
         params = {
+            "symbols": list(symbols),
             "freq": norm_freq,
             "start": start_dt.strftime("%Y-%m-%d %H:%M:%S"),
             "end": effective_end.strftime("%Y-%m-%d %H:%M:%S"),
@@ -324,8 +331,8 @@ class ClickHouseLoader:
         Returns
         -------
         pl.DataFrame
-            Schema: ``ts, symbol, open, high, low, close, volume, vwap``.
-            Only periods with at least one tick are returned (no empty bars).
+            Schema: :data:`BAR_SCHEMA`.  Bars are truncated in New York local
+            time.  Only periods with at least one tick are returned (no empty bars).
         """
         # Validate required columns are present (before empty check so error always fires)
         required = {"ts", "symbol", "price", "size"}
@@ -338,17 +345,22 @@ class ClickHouseLoader:
         if tick_df.is_empty():
             return pl.DataFrame(schema=BAR_SCHEMA)
 
-        polars_freq = _to_polars_duration(freq)
-
+        # Truncate in exchange-local time so a "1d" bar is one New York session date,
+        # not a UTC midnight-to-midnight window that splits the evening.
+        # shortcut: includes pre/post-market ticks; filter to regular hours once calendar.py exists.
+        bar_local = (
+            pl.col("ts")
+            .dt.convert_time_zone(EXCHANGE_TZ)
+            .dt.truncate(_to_polars_duration(freq))
+        )
         bars = (
             tick_df
             .sort("ts")
             .with_columns(
-                pl.col("ts")
-                .dt.truncate(polars_freq)
-                .alias("bar_ts")
+                bar_local.dt.convert_time_zone("UTC").alias("bar_ts"),
+                bar_local.dt.date().alias("session_date"),
             )
-            .group_by(["symbol", "bar_ts"])
+            .group_by(["symbol", "bar_ts", "session_date"])
             .agg(
                 pl.col("price").first().alias("open"),
                 pl.col("price").max().alias("high"),
@@ -362,7 +374,7 @@ class ClickHouseLoader:
                 ).alias("vwap"),
             )
             .rename({"bar_ts": "ts"})
-            .select(["ts", "symbol", "open", "high", "low", "close", "volume", "vwap"])
+            .select(list(BAR_SCHEMA))
             .sort(["symbol", "ts"])
         )
         return bars
@@ -391,12 +403,6 @@ class ClickHouseLoader:
         df = _cast_to_schema(df, schema)
         return df
 
-    @staticmethod
-    def _format_symbol_list(symbols: Sequence[str]) -> str:
-        """Return a SQL-safe comma-separated quoted symbol list."""
-        escaped = [f"'{s.replace(chr(39), chr(39)*2)}'" for s in symbols]
-        return ", ".join(escaped)
-
 
 # ---------------------------------------------------------------------------
 # Module-level helpers
@@ -420,27 +426,8 @@ def _normalise_freq(freq: str) -> str:
 
 
 def _to_polars_duration(freq: str) -> str:
-    """
-    Convert a frequency string to a Polars duration string for ``dt.truncate``.
-
-    Polars duration strings use ``"Xm"`` for X minutes, ``"Xh"`` for hours,
-    ``"Xd"`` for days, ``"1w"`` for a week, etc.
-    """
-    _mapping: dict[str, str] = {
-        "1t": "1m",
-        "1min": "1m",
-        "5t": "5m",
-        "5min": "5m",
-        "15t": "15m",
-        "15min": "15m",
-        "30t": "30m",
-        "30min": "30m",
-        "1h": "1h",
-        "4h": "4h",
-        "1d": "1d",
-        "1w": "1w",
-    }
-    return _mapping.get(freq.lower(), freq.lower())
+    """Convert a frequency string to a Polars ``dt.truncate`` duration (same aliases as storage)."""
+    return _normalise_freq(freq)
 
 
 def _cast_to_schema(

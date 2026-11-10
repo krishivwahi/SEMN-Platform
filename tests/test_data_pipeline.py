@@ -33,6 +33,7 @@ from semn.data.clickhouse_loader import (
     _to_polars_duration,
 )
 from semn.data.universe import (
+    ADV_WINDOW,
     UNIVERSE_SCHEMA,
     LiquidityFilter,
     UniverseBuilder,
@@ -86,6 +87,7 @@ def _bar_pandas(
         "close": base_price + 1.0,
         "volume": 1_000_000.0,
         "vwap": base_price + 0.5,
+        "session_date": rng.tz_convert("America/New_York").date,
     })
 
 
@@ -188,6 +190,17 @@ class TestGetTickData:
         )
         params = mock_client.query_df.call_args[1]["parameters"]
         assert params["end"].startswith("2024-06-30")
+
+    def test_symbols_are_bound_not_interpolated(self):
+        """Symbols travel as an Array(String) parameter; nothing user-supplied is spliced into SQL."""
+        mock_client = _make_mock_client(_tick_pandas(n=3))
+        loader = ClickHouseLoader(client=mock_client)
+        loader.get_tick_data(["AAPL", "O'NEIL"], "2024-01-02", "2024-01-03")
+        sql = mock_client.query_df.call_args[0][0]
+        params = mock_client.query_df.call_args[1]["parameters"]
+        assert params["symbols"] == ["AAPL", "O'NEIL"]
+        assert "{symbols:Array(String)}" in sql
+        assert "NEIL" not in sql
 
 
 # ---------------------------------------------------------------------------
@@ -324,223 +337,253 @@ class TestResampleTicksToBars:
         bars = ClickHouseLoader.resample_ticks_to_bars(tick_df, "1d")
         assert set(bars["symbol"].to_list()) == {"AAPL", "MSFT"}
 
+    def test_daily_bars_follow_new_york_session_date(self):
+        """17:00 and 21:00 New York on Jan 2 are one daily bar dated Jan 2, though UTC dates differ."""
+        tick_df = pl.DataFrame({
+            "ts": pl.Series([
+                datetime(2024, 1, 2, 22, 0, tzinfo=timezone.utc),
+                datetime(2024, 1, 3, 2, 0, tzinfo=timezone.utc),
+            ]).cast(pl.Datetime("us", "UTC")),
+            "symbol": ["AAPL", "AAPL"],
+            "price": [100.0, 101.0],
+            "size": [10.0, 10.0],
+        })
+        bars = ClickHouseLoader.resample_ticks_to_bars(tick_df, "1d")
+        assert len(bars) == 1
+        assert bars["session_date"][0] == date(2024, 1, 2)
+        assert bars["ts"][0] == datetime(2024, 1, 2, 5, 0, tzinfo=timezone.utc)
+        assert bars["close"][0] == 101.0
+
 
 # ---------------------------------------------------------------------------
-# UniverseBuilder — basic construction
+# UniverseBuilder — fixtures
 # ---------------------------------------------------------------------------
+
+AS_OF = date(2024, 1, 2)
+
+
+def _sessions(n: int = ADV_WINDOW, end: date = AS_OF) -> list[date]:
+    """*n* business days ending on *end* (stand-in for exchange sessions)."""
+    return [d.date() for d in pd.bdate_range(end=end, periods=n)]
+
+
+def _history(sid: str, close, volume=1e6, sessions: Optional[list[date]] = None) -> pl.DataFrame:
+    """Raw daily rows for one security; *close*/*volume* may be scalars or per-session lists."""
+    sessions = sessions or _sessions()
+    n = len(sessions)
+    return pl.DataFrame({
+        "date": sessions,
+        "security_id": [sid] * n,
+        "close": [float(c) for c in (close if isinstance(close, list) else [close] * n)],
+        "volume": [float(v) for v in (volume if isinstance(volume, list) else [volume] * n)],
+    })
+
 
 def _make_membership(rows: list[tuple]) -> pl.DataFrame:
-    """rows: [(symbol, index, entry_date, exit_date), ...]"""
+    """rows: [(security_id, index, entry_date, exit_date), ...]"""
     return pl.DataFrame({
-        "symbol": [r[0] for r in rows],
+        "security_id": [r[0] for r in rows],
         "index": [r[1] for r in rows],
         "entry_date": pl.Series([r[2] for r in rows]).str.to_date(),
         "exit_date": pl.Series([r[3] for r in rows]).str.to_date(),
     })
 
 
-def _make_price(rows: list[tuple]) -> pl.DataFrame:
-    """rows: [(date, symbol, close), ...]"""
-    return pl.DataFrame({
-        "date": pl.Series([r[0] for r in rows]).str.to_date() if rows else pl.Series([], dtype=pl.Date),
-        "symbol": [r[1] for r in rows],
-        "close": pl.Series([r[2] for r in rows], dtype=pl.Float64),
-    })
-
-
-def _make_adv(rows: list[tuple]) -> pl.DataFrame:
-    """rows: [(date, symbol, adv_20d), ...]"""
-    return pl.DataFrame({
-        "date": pl.Series([r[0] for r in rows]).str.to_date() if rows else pl.Series([], dtype=pl.Date),
-        "symbol": [r[1] for r in rows],
-        "adv_20d": pl.Series([r[2] for r in rows], dtype=pl.Float64),
-    })
-
-
 def _make_mcap(rows: list[tuple]) -> pl.DataFrame:
-    """rows: [(date, symbol, market_cap), ...]"""
+    """rows: [(date, security_id, market_cap), ...]"""
     return pl.DataFrame({
-        "date": pl.Series([r[0] for r in rows]).str.to_date() if rows else pl.Series([], dtype=pl.Date),
-        "symbol": [r[1] for r in rows],
+        "date": pl.Series([r[0] for r in rows], dtype=pl.Utf8).str.to_date(),
+        "security_id": pl.Series([r[1] for r in rows], dtype=pl.Utf8),
         "market_cap": pl.Series([r[2] for r in rows], dtype=pl.Float64),
     })
 
 
+def _builder(members: list[tuple], prices: list[pl.DataFrame], mcap: list[tuple] = ()) -> UniverseBuilder:
+    return UniverseBuilder(_make_membership(members), pl.concat(prices), _make_mcap(list(mcap)))
+
+
+ACTIVE = ("2020-01-01", "9999-12-31")
+
+
 class TestUniverseBuilderInit:
     def test_missing_membership_col_raises(self):
-        bad = pl.DataFrame({"symbol": [], "index": []})  # missing entry/exit date
+        bad = pl.DataFrame({"security_id": [], "index": []})  # missing entry/exit date
         with pytest.raises(ValueError, match="membership_df"):
+            UniverseBuilder(bad, _history("A", 10.0), _make_mcap([]))
+
+    def test_price_without_volume_raises(self):
+        """ADV is computed in-house, so raw volume is required."""
+        with pytest.raises(ValueError, match="price_df"):
             UniverseBuilder(
-                membership_df=bad,
-                price_df=_make_price([]),
-                adv_df=_make_adv([]),
-                mcap_df=_make_mcap([]),
+                _make_membership([("A", "SP500", *ACTIVE)]),
+                _history("A", 10.0).drop("volume"),
+                _make_mcap([]),
             )
 
 
+# ---------------------------------------------------------------------------
+# UniverseBuilder — single date
+# ---------------------------------------------------------------------------
+
 class TestUniverseBuilderBuild:
     def _default_builder(self) -> UniverseBuilder:
-        membership = _make_membership([
-            ("AAPL", "SP500", "2020-01-01", "9999-12-31"),
-            ("MSFT", "SP500", "2020-01-01", "9999-12-31"),
-            ("DELISTED", "SP500", "2020-01-01", "2023-12-31"),  # delisted before as_of
-            ("NOTYET", "SP500", "2025-01-01", "9999-12-31"),    # added after as_of
-        ])
-        price = _make_price([
-            ("2024-01-02", "AAPL", 180.0),
-            ("2024-01-02", "MSFT", 380.0),
-            ("2024-01-02", "DELISTED", 5.0),
-            ("2024-01-02", "NOTYET", 50.0),
-        ])
-        adv = _make_adv([
-            ("2024-01-02", "AAPL", 5_000_000.0),
-            ("2024-01-02", "MSFT", 8_000_000.0),
-            ("2024-01-02", "DELISTED", 200_000.0),
-            ("2024-01-02", "NOTYET", 1_500_000.0),
-        ])
-        mcap = _make_mcap([
-            ("2024-01-02", "AAPL", 3e12),
-            ("2024-01-02", "MSFT", 2.5e12),
-            ("2024-01-02", "DELISTED", 1e8),
-            ("2024-01-02", "NOTYET", 5e9),
-        ])
-        return UniverseBuilder(membership, price, adv, mcap)
-
-    def test_basic_build_returns_dataframe(self):
-        builder = self._default_builder()
-        result = builder.build("2024-01-02", index="SP500")
-        assert isinstance(result, pl.DataFrame)
+        return _builder(
+            [
+                ("AAPL", "SP500", *ACTIVE),
+                ("MSFT", "SP500", *ACTIVE),
+                ("DELISTED", "SP500", "2020-01-01", "2023-12-31"),
+                ("NOTYET", "SP500", "2025-01-01", "9999-12-31"),
+            ],
+            [_history(s, 100.0) for s in ("AAPL", "MSFT", "DELISTED", "NOTYET")],
+            [("2024-01-02", "AAPL", 3e12), ("2024-01-02", "MSFT", 2.5e12)],
+        )
 
     def test_output_schema(self):
-        builder = self._default_builder()
-        result = builder.build("2024-01-02", index="SP500")
-        for col in UNIVERSE_SCHEMA:
-            assert col in result.columns
+        result = self._default_builder().build(AS_OF, index="SP500")
+        assert result.columns == list(UNIVERSE_SCHEMA)
 
-    def test_pit_excludes_delisted_symbol(self):
-        """Symbol with exit_date <= as_of_date must not appear in the universe."""
-        builder = self._default_builder()
-        result = builder.build("2024-01-02", index="SP500")
-        assert "DELISTED" not in result["symbol"].to_list()
+    def test_pit_excludes_delisted_and_future_members(self):
+        ids = self._default_builder().build(AS_OF, index="SP500")["security_id"].to_list()
+        assert ids == ["AAPL", "MSFT"]
 
-    def test_pit_excludes_future_addition(self):
-        """Symbol with entry_date > as_of_date must not appear in the universe."""
-        builder = self._default_builder()
-        result = builder.build("2024-01-02", index="SP500")
-        assert "NOTYET" not in result["symbol"].to_list()
+    def test_adv_is_raw_close_times_raw_volume(self):
+        result = self._default_builder().build(AS_OF)
+        assert result["adv_20d"].to_list() == [100.0 * 1e6, 100.0 * 1e6]
 
-    def test_active_symbols_are_present(self):
-        """Symbols that are active on as_of_date and pass all filters appear."""
-        builder = self._default_builder()
-        result = builder.build("2024-01-02", index="SP500",
-                               adv_floor=1_000_000, price_floor=5.0, mcap_floor=1e9)
-        symbols = result["symbol"].to_list()
-        assert "AAPL" in symbols
-        assert "MSFT" in symbols
-
-    def test_adv_floor_excludes_illiquid(self):
-        """Symbols below the ADV floor are excluded."""
-        membership = _make_membership([
-            ("AAPL", "SP500", "2020-01-01", "9999-12-31"),
-            ("ILLIQ", "SP500", "2020-01-01", "9999-12-31"),
-        ])
-        price = _make_price([("2024-01-02", "AAPL", 180.0), ("2024-01-02", "ILLIQ", 50.0)])
-        adv = _make_adv([("2024-01-02", "AAPL", 5e6), ("2024-01-02", "ILLIQ", 499_999.0)])
-        mcap = _make_mcap([("2024-01-02", "AAPL", 3e12), ("2024-01-02", "ILLIQ", 1e10)])
-        builder = UniverseBuilder(membership, price, adv, mcap)
-        result = builder.build("2024-01-02", adv_floor=500_000.0)
-        assert "AAPL" in result["symbol"].to_list()
-        assert "ILLIQ" not in result["symbol"].to_list()
-
-    def test_adv_floor_boundary_exact_value_is_included(self):
-        """A symbol exactly at the ADV floor must be included (>=, not >)."""
-        membership = _make_membership([("AAPL", "SP500", "2020-01-01", "9999-12-31")])
-        price = _make_price([("2024-01-02", "AAPL", 180.0)])
-        adv = _make_adv([("2024-01-02", "AAPL", 1_000_000.0)])
-        mcap = _make_mcap([("2024-01-02", "AAPL", 3e12)])
-        builder = UniverseBuilder(membership, price, adv, mcap)
-        result = builder.build("2024-01-02", adv_floor=1_000_000.0)
-        assert "AAPL" in result["symbol"].to_list()
+    def test_adv_floor_boundary(self):
+        """Exactly at the floor is included (>=); just below is excluded."""
+        b = _builder(
+            [("AT", "SP500", *ACTIVE), ("BELOW", "SP500", *ACTIVE)],
+            [_history("AT", 25.0, 1e6), _history("BELOW", 25.0, 999_999.0)],
+        )
+        assert b.build(AS_OF, adv_floor=25e6)["security_id"].to_list() == ["AT"]
 
     def test_price_floor_boundary_below_excludes(self):
-        """A symbol with close just below the price floor must be excluded."""
-        membership = _make_membership([("PENNY", "SP500", "2020-01-01", "9999-12-31")])
-        price = _make_price([("2024-01-02", "PENNY", 4.99)])
-        adv = _make_adv([("2024-01-02", "PENNY", 2e6)])
-        mcap = _make_mcap([("2024-01-02", "PENNY", 5e8)])
-        builder = UniverseBuilder(membership, price, adv, mcap)
-        result = builder.build("2024-01-02", price_floor=5.0)
-        assert result.is_empty()
+        b = _builder([("PENNY", "SP500", *ACTIVE)], [_history("PENNY", 4.99, 1e8)])
+        assert b.build(AS_OF, price_floor=5.0).is_empty()
 
     def test_mcap_floor_excludes_small_cap(self):
-        """Symbols below the market-cap floor are excluded."""
-        membership = _make_membership([("SMALL", "SP500", "2020-01-01", "9999-12-31")])
-        price = _make_price([("2024-01-02", "SMALL", 10.0)])
-        adv = _make_adv([("2024-01-02", "SMALL", 2e6)])
-        mcap = _make_mcap([("2024-01-02", "SMALL", 2.99e8)])
-        builder = UniverseBuilder(membership, price, adv, mcap)
-        result = builder.build("2024-01-02", mcap_floor=3e8)
-        assert result.is_empty()
+        b = _builder(
+            [("SMALL", "SP500", *ACTIVE)], [_history("SMALL", 10.0)],
+            [("2024-01-02", "SMALL", 2.99e8)],
+        )
+        assert b.build(AS_OF, mcap_floor=3e8).is_empty()
+
+    def test_missing_mcap_is_fine_without_mcap_floor(self):
+        b = _builder([("NOCAP", "SP500", *ACTIVE)], [_history("NOCAP", 10.0)])
+        assert b.build(AS_OF)["security_id"].to_list() == ["NOCAP"]
+        assert b.build(AS_OF, mcap_floor=1.0).is_empty()
 
     def test_index_filter(self):
-        """Index filter restricts result to symbols in that index."""
-        membership = _make_membership([
-            ("AAPL", "SP500", "2020-01-01", "9999-12-31"),
-            ("EXTRA", "R1000", "2020-01-01", "9999-12-31"),
-        ])
-        price = _make_price([("2024-01-02", "AAPL", 180.0), ("2024-01-02", "EXTRA", 50.0)])
-        adv = _make_adv([("2024-01-02", "AAPL", 5e6), ("2024-01-02", "EXTRA", 5e6)])
-        mcap = _make_mcap([("2024-01-02", "AAPL", 3e12), ("2024-01-02", "EXTRA", 1e10)])
-        builder = UniverseBuilder(membership, price, adv, mcap)
-        result = builder.build("2024-01-02", index="SP500")
-        assert all(r == "SP500" for r in result["index"].to_list())
-        assert "EXTRA" not in result["symbol"].to_list()
-
-    def test_no_data_returns_empty_dataframe(self):
-        """build() on a date with no members returns an empty DataFrame."""
-        membership = _make_membership([
-            ("AAPL", "SP500", "2025-01-01", "9999-12-31"),  # future entry
-        ])
-        builder = UniverseBuilder(
-            membership,
-            _make_price([("2024-01-02", "AAPL", 180.0)]),
-            _make_adv([("2024-01-02", "AAPL", 5e6)]),
-            _make_mcap([("2024-01-02", "AAPL", 3e12)]),
+        b = _builder(
+            [("AAPL", "SP500", *ACTIVE), ("EXTRA", "R1000", *ACTIVE)],
+            [_history("AAPL", 100.0), _history("EXTRA", 100.0)],
         )
-        result = builder.build("2024-01-02")
+        assert b.build(AS_OF, index="SP500")["security_id"].to_list() == ["AAPL"]
+
+    def test_no_members_returns_empty_dataframe(self):
+        b = _builder([("AAPL", "SP500", "2025-01-01", "9999-12-31")], [_history("AAPL", 100.0)])
+        result = b.build(AS_OF)
         assert result.is_empty()
-        assert set(result.columns) == set(UNIVERSE_SCHEMA.keys())
+        assert result.columns == list(UNIVERSE_SCHEMA)
 
-    def test_pit_slice_uses_last_available_date(self):
-        """_pit_slice returns the most recent observation on or before as_of_date."""
-        membership = _make_membership([("AAPL", "SP500", "2020-01-01", "9999-12-31")])
-        # Price data: only available on Jan 2, not Jan 3
-        price = _make_price([("2024-01-02", "AAPL", 200.0)])
-        adv = _make_adv([("2024-01-02", "AAPL", 5e6)])
-        mcap = _make_mcap([("2024-01-02", "AAPL", 3e12)])
-        builder = UniverseBuilder(membership, price, adv, mcap)
-        # as_of Jan 3: last available price is Jan 2 → should still work
-        result = builder.build("2024-01-03")
-        assert "AAPL" in result["symbol"].to_list()
-        assert result.filter(pl.col("symbol") == "AAPL")["close"][0] == 200.0
+    def test_uses_last_observation_on_or_before_date(self):
+        b = _builder([("AAPL", "SP500", *ACTIVE)], [_history("AAPL", 200.0)])
+        result = b.build(date(2024, 1, 3))  # no row on Jan 3; Jan 2 is the last one
+        assert result["close"].to_list() == [200.0]
 
+    def test_future_observations_never_leak(self):
+        sessions = _sessions(ADV_WINDOW + 1, end=date(2024, 1, 3))
+        b = _builder([("AAPL", "SP500", *ACTIVE)], [_history("AAPL", [100.0] * ADV_WINDOW + [999.0], sessions=sessions)])
+        assert b.build(AS_OF)["close"].to_list() == [100.0]
+
+
+# ---------------------------------------------------------------------------
+# Raw prices, splits, ADV history, staleness
+# ---------------------------------------------------------------------------
+
+class TestRawPricesAndHistory:
+    def _split_builder(self) -> tuple[UniverseBuilder, list[date]]:
+        """10:1 split after session 25: raw close 40 → 4, raw volume ×10."""
+        sessions = _sessions(30)
+        close = [40.0] * 25 + [4.0] * 5
+        volume = [1e6] * 25 + [1e7] * 5
+        return _builder([("SPLIT", "SP500", *ACTIVE)], [_history("SPLIT", close, volume, sessions)]), sessions
+
+    def test_price_floor_uses_raw_price_before_split(self):
+        """Split-adjusted, the pre-split close would be $4 and fail the $5 floor; raw is $40."""
+        b, sessions = self._split_builder()
+        assert b.build(sessions[24], price_floor=5.0)["security_id"].to_list() == ["SPLIT"]
+        assert b.build(sessions[25], price_floor=5.0).is_empty()
+
+    def test_adv_does_not_jump_on_split_date(self):
+        b, sessions = self._split_builder()
+        adv = b.build_panel(sessions[19:])["adv_20d"].to_list()
+        assert adv == [40e6] * len(adv)
+
+    def test_insufficient_adv_history_is_excluded(self):
+        b = _builder([("NEW", "SP500", *ACTIVE)], [_history("NEW", 50.0, sessions=_sessions(ADV_WINDOW - 1))])
+        assert b.build(AS_OF).is_empty()
+        assert b.exclusions([AS_OF])["exclusion"].to_list() == ["adv_history"]
+
+    def test_stale_observations_are_excluded_and_reported(self):
+        """HALT stops trading; it survives 5 sessions of staleness and is dropped on the 6th."""
+        sessions = _sessions(30)
+        b = _builder(
+            [("LIVE", "SP500", *ACTIVE), ("HALT", "SP500", *ACTIVE)],
+            [_history("LIVE", 50.0, sessions=sessions), _history("HALT", 50.0, sessions=sessions[:24])],
+        )
+        assert "HALT" in b.build(sessions[23 + 5], max_staleness=5)["security_id"].to_list()
+        assert "HALT" not in b.build(sessions[23 + 6], max_staleness=5)["security_id"].to_list()
+        report = b.exclusions([sessions[29]], max_staleness=5)
+        assert report.select("security_id", "exclusion").rows() == [("HALT", "stale")]
+
+    def test_exclusion_reasons(self):
+        b = _builder(
+            [("CHEAP", "SP500", *ACTIVE), ("THIN", "SP500", *ACTIVE), ("NODATA", "SP500", *ACTIVE)],
+            [_history("CHEAP", 1.0, 1e9), _history("THIN", 50.0, 1.0)],
+        )
+        report = b.exclusions([AS_OF], **LiquidityFilter().as_kwargs())
+        assert dict(report.select("security_id", "exclusion").rows()) == {
+            "CHEAP": "price_floor", "THIN": "adv_floor", "NODATA": "no_data",
+        }
+
+
+# ---------------------------------------------------------------------------
+# UniverseBuilder — panel
+# ---------------------------------------------------------------------------
 
 class TestUniverseBuilderPanel:
-    def test_build_panel_returns_long_format(self):
-        membership = _make_membership([("AAPL", "SP500", "2020-01-01", "9999-12-31")])
-        price = _make_price([
-            ("2024-01-02", "AAPL", 180.0),
-            ("2024-01-03", "AAPL", 182.0),
-            ("2024-01-04", "AAPL", 184.0),
-        ])
-        adv = _make_adv([("2024-01-02", "AAPL", 5e6)])
-        mcap = _make_mcap([("2024-01-02", "AAPL", 3e12)])
-        builder = UniverseBuilder(membership, price, adv, mcap)
-        panel = builder.build_panel(["2024-01-02", "2024-01-03", "2024-01-04"])
-        assert len(panel) == 3
-        assert set(panel["date"].to_list()) == {
-            date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4)
-        }
+    def _builder(self) -> tuple[UniverseBuilder, list[date]]:
+        sessions = _sessions(60)
+        members = [
+            ("A", "SP500", "2020-01-01", "9999-12-31"),
+            ("B", "SP500", str(sessions[30]), "9999-12-31"),   # joins mid-panel
+            ("C", "SP500", "2020-01-01", str(sessions[40])),   # exits mid-panel
+            ("D", "SP500", str(sessions[25]), str(sessions[35])),
+        ]
+        prices = [_history(s, 10.0 + i, sessions=sessions) for i, s in enumerate("ABCD")]
+        return _builder(members, prices), sessions
+
+    def test_membership_holds_on_every_rebalance_date(self):
+        """No security before its entry date or on/after its exit date, on any date in the panel."""
+        b, sessions = self._builder()
+        membership = b._membership
+        panel = b.build_panel(sessions).join(membership, on="security_id")
+        assert not panel.is_empty()
+        assert panel.filter(
+            (pl.col("date") < pl.col("entry_date")) | (pl.col("date") >= pl.col("exit_date"))
+        ).is_empty()
+        assert set(panel.filter(pl.col("date") == sessions[40])["security_id"]) == {"A", "B"}
+
+    def test_panel_equals_per_date_builds(self):
+        b, sessions = self._builder()
+        per_date = pl.concat([b.build(d) for d in sessions])
+        plt.assert_frame_equal(b.build_panel(sessions), per_date)
+
+    def test_panel_is_deterministic(self):
+        b, sessions = self._builder()
+        plt.assert_frame_equal(b.build_panel(sessions[::-1]), b.build_panel(sessions))
 
 
 # ---------------------------------------------------------------------------
@@ -548,20 +591,15 @@ class TestUniverseBuilderPanel:
 # ---------------------------------------------------------------------------
 
 class TestLiquidityFilter:
-    def test_default_values(self):
-        f = LiquidityFilter()
-        assert f.adv_floor == 1_000_000.0
-        assert f.price_floor == 5.0
-        assert f.mcap_floor == 300_000_000.0
+    def test_default_values_match_roadmap(self):
+        assert LiquidityFilter().as_kwargs() == {
+            "adv_floor": 25e6, "price_floor": 5.0, "mcap_floor": 0.0, "max_staleness": 5,
+        }
 
-    def test_as_kwargs(self):
-        f = LiquidityFilter(adv_floor=2e6, price_floor=10.0, mcap_floor=1e9)
-        kwargs = f.as_kwargs()
-        assert kwargs == {"adv_floor": 2e6, "price_floor": 10.0, "mcap_floor": 1e9}
-
-    def test_repr(self):
-        f = LiquidityFilter()
-        assert "LiquidityFilter" in repr(f)
+    def test_as_kwargs_feeds_build(self):
+        b = _builder([("A", "SP500", *ACTIVE)], [_history("A", 30.0, 1e6)])
+        assert b.build(AS_OF, **LiquidityFilter().as_kwargs())["security_id"].to_list() == ["A"]
+        assert b.build(AS_OF, **LiquidityFilter(adv_floor=31e6).as_kwargs()).is_empty()
 
 
 # ---------------------------------------------------------------------------
