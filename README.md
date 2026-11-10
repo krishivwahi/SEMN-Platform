@@ -41,3 +41,15 @@ semn-platform/
 pip install -e ".[dev]"            # core + tests
 pip install -e ".[clickhouse]"     # optional ClickHouse backend
 ```
+
+## Data
+
+Free S&P 500 data (Tiingo end-of-day prices + historical membership); get a free key at tiingo.com:
+
+```bash
+export TIINGO_API_KEY=...
+python -m semn.data.sources.tiingo --start 2010-01-01 --root data/store --cache data/cache
+```
+
+Downloads are cached and resume after the free tier's rate limit. Vendor data stays in `data/`
+(git-ignored). Coverage and known gaps: see D1 in [ROADMAP.md](ROADMAP.md).

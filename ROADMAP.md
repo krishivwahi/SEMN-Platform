@@ -9,7 +9,7 @@
 |---|---|
 | **Version** | v2 (2026-11-10) — supersedes the original 7-phase PDF roadmap |
 | **Timeline** | ~19 weeks (4.5 months) for the core platform; stretch tracks are extra |
-| **Current status** | Phase 1 built and tested except the vendor adapter, which waits on decision D1. See [Phase 1 status](#phase-1-status) |
+| **Current status** | Phase 1 complete on free data (D1 interim). Phase 2 needs a GICS / market-cap source. See [Phase 1 status](#phase-1-status) |
 
 ---
 
@@ -60,13 +60,32 @@ Python orchestrates research; pybind11 (or nanobind) connects Python to the C++2
 
 | ID | Decision | Options | Blocks | Status |
 |---|---|---|---|---|
-| **D1** | Market & reference data vendor | CRSP + Compustat via WRDS (gold standard, needs institutional access) · Norgate (delisted names + historical index membership) · Sharadar via Nasdaq Data Link (delisted names, PIT fundamentals with filing dates) · Free sources (Wikipedia/GitHub constituent lists — noisy, no delisting returns) | Phase 1 wk 1, Phase 2 fundamentals & GICS | **Pending** |
+| **D1** | Market & reference data vendor | CRSP + Compustat via WRDS (gold standard, needs institutional access) · Norgate (delisted names + historical index membership) · Sharadar via Nasdaq Data Link (delisted names, PIT fundamentals with filing dates) · Free sources (Wikipedia/GitHub constituent lists — noisy, no delisting returns) | Phase 1 wk 1, Phase 2 fundamentals & GICS | **Interim: free** — Tiingo EOD + GitHub S&P 500 membership (see below); revisit before Phase 2 |
 | D2 | Storage backend | Parquet + Polars (default) · ClickHouse (only if query patterns justify it) | Phase 1 | Parquet first |
 | D3 | Tick / L2 data for stretch tracks | Databento, Polygon, or skip | Stretch S1, S2 | Deferred |
 
 The vendor chosen in D1 must provide, at minimum: raw unadjusted OHLCV, split and dividend events,
 delisting dates **and delisting returns/prices**, historical ticker changes, historical index
 membership with effective dates, and (for Phase 2) point-in-time fundamentals and GICS history.
+
+### D1 interim choice: free data (2026-11-10)
+
+`semn/data/sources/tiingo.py` + `sp500_github.py`, run with
+`TIINGO_API_KEY=... python -m semn.data.sources.tiingo --start 2010-01-01`.
+
+| Requirement | Free source | Gap |
+|---|---|---|
+| Raw OHLCV, splits, dividends | Tiingo EOD (`close`, `volume`, `splitFactor`, `divCash`) | none |
+| Delisted names | Tiingo ticker list keeps them (CELG, TWTR, XLNX, SIVBQ…) | a reused ticker's older listing has no prices |
+| Historical index membership | github.com/fja05680/sp500 (MIT), pinned to a commit | compiled from public sources, not S&P |
+| Ticker changes | hand-checked `RENAMES` table (25 entries) + `rename_suggestions` report | renames not in the table stay unmapped |
+| Delisting returns | — | none: 0% fallback (biases returns of failed names upward) |
+| GICS history, market cap, fundamentals | — | **blocks Phase 2**; SEC EDGAR (SIC codes, shares outstanding, filing dates) is the free candidate |
+
+Share of S&P 500 members mapped to a priced security: 85% (2010), 91% (2015),
+96% (2018), 98% (2021), 99.6% (2024). The rest are reported in `unmapped_membership`.
+Free tier: 50 requests/hour, so a 2010+ build (744 tickers) takes about 15 hours; downloads
+are cached and resumable. Tiingo forbids redistribution: vendor data stays under `/data/`, never in git.
 
 ---
 
@@ -155,11 +174,11 @@ Reproducible point-in-time universe snapshots with manifests, a total-return pan
 
 ### Phase 1 status
 
-Everything except the vendor adapter is built and tested; the adapter waits on **D1**.
+Built and tested. The vendor adapter uses the interim free sources (D1 above); every test runs offline.
 
 | Item | Status |
 |---|---|
-| Vendor adapter (`sources/<vendor>.py`) → raw Parquet | ⏸ blocked on **D1** |
+| Vendor adapter (`sources/tiingo.py`, `sources/sp500_github.py`) → raw Parquet | ✅ free interim sources; ticker history passes `SecurityMaster` validation on the real files |
 | Security master (`security_master.py`): `security_id`, dated ticker + GICS history | ✅ overlapping intervals rejected; unmapped vendor rows reported |
 | Trading calendar (`calendar.py`): NYSE sessions, rebalance dates | ✅ `exchange_calendars` XNYS |
 | Corporate actions (`corporate_actions.py`): total returns, delisting returns | ✅ split/dividend factors from raw prices; delisting return compounded once (−30% fallback for performance delistings) |
