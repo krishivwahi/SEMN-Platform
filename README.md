@@ -12,7 +12,8 @@ A high-performance quantitative research and execution platform for systematic e
 ```
 semn-platform/
 ├── CMakeLists.txt          # C++20 build config
-├── requirements.txt        # Python dependencies
+├── pyproject.toml          # Python package + extras: [clickhouse], [report], [hawkes], [dev]
+├── ROADMAP.md              # Engineering roadmap (v2)
 ├── src/core/               # High-performance C++20 execution core
 ├── semn/
 │   ├── data/               # Data pipeline & universe construction
@@ -30,5 +31,12 @@ semn-platform/
 
 - **Python 3.11+** — research, modelling, data pipeline
 - **C++20** — execution core, exposed to Python via pybind11
-- **ClickHouse** — columnar market data storage
+- **ClickHouse** (optional) — columnar market data storage
 - **Polars / PyArrow** — high-performance dataframe operations
+
+## Install
+
+```bash
+pip install -e ".[dev]"            # core + tests
+pip install -e ".[clickhouse]"     # optional ClickHouse backend
+```
