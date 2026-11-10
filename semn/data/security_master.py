@@ -58,7 +58,7 @@ class SecurityMaster:
 def _as_of(df: pl.DataFrame, history: pl.DataFrame, key: str, value_cols: list[str], date_col: str) -> pl.DataFrame:
     """Inner-join *df* to the *history* row whose interval contains the row's date."""
     return (
-        df.join(history.select(key, *value_cols, *_INTERVAL), on=key, how="inner")
+        df.join(history.select(key, *value_cols, *_INTERVAL), on=key, how="inner", maintain_order="left")
         .filter((pl.col("valid_from") <= pl.col(date_col)) & (pl.col(date_col) < pl.col("valid_to")))
         .drop(_INTERVAL)
     )

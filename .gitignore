@@ -24,7 +24,8 @@ compile_commands.json
 _semn_core*.pyd
 _semn_core*.so
 
-# Data & notebooks
+# Data & notebooks (vendor data must never be committed: Tiingo forbids redistribution)
+/data/
 *.parquet
 *.csv
 *.feather
