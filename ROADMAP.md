@@ -9,7 +9,7 @@
 |---|---|
 | **Version** | v2 (2026-11-10) — supersedes the original 7-phase PDF roadmap |
 | **Timeline** | ~19 weeks (4.5 months) for the core platform; stretch tracks are extra |
-| **Current status** | Phase 1 in progress: fixes to existing code done; week-1 work (D1, security master, calendar) next. See [Phase 1 status](#phase-1-status) |
+| **Current status** | Phase 1 built and tested except the vendor adapter, which waits on decision D1. See [Phase 1 status](#phase-1-status) |
 
 ---
 
@@ -140,14 +140,14 @@ semn/data/
 ### Verification invariants (tests)
 
 - [x] No security appears before its inclusion date or on/after its exit date — checked across **every** rebalance date in the panel (fixture test; property-based version still to add).
-- [ ] A reused ticker never merges two securities.
+- [x] A reused ticker never merges two securities.
 - [x] The $5 price floor and ADV use raw prices (fixture: a stock with a later 10:1 split must pass the floor before the split).
 - [x] ADV does not spike on a split date.
-- [ ] Total return across a split day equals the economic return (split-neutral).
-- [ ] Delisting return is applied exactly once, on the delisting date.
+- [x] Total return across a split day equals the economic return (split-neutral).
+- [x] Delisting return is applied exactly once, on the delisting date.
 - [x] Stale observations older than `max_staleness` are excluded and reported.
-- [ ] Building the same snapshot twice yields the same content hash.
-- [ ] Panel build for N ≥ 500 × T ≥ 2,500 completes in seconds; single cross-section retrieval is sub-second.
+- [x] Building the same snapshot twice yields the same content hash.
+- [x] Panel build for N ≥ 500 × T ≥ 2,500 completes in seconds; single cross-section retrieval is sub-second (measured 1.4 s / 0.14 s at 500 × 2,768 sessions; a benchmark, not a CI test).
 
 ### Deliverable
 
@@ -155,19 +155,20 @@ Reproducible point-in-time universe snapshots with manifests, a total-return pan
 
 ### Phase 1 status
 
+Everything except the vendor adapter is built and tested; the adapter waits on **D1**.
+
 | Item | Status |
 |---|---|
-| PIT membership filter (`entry ≤ t < exit`) | ✅ `universe.py`, checked on every panel date |
-| Last-observation-on-or-before (`join_asof`) with `max_staleness` | ✅ stale names excluded and reported via `exclusions()` |
-| Vectorized universe panel | ✅ 500 × 2,500 panel in ~0.2 s; single date ~50 ms |
+| Vendor adapter (`sources/<vendor>.py`) → raw Parquet | ⏸ blocked on **D1** |
+| Security master (`security_master.py`): `security_id`, dated ticker + GICS history | ✅ overlapping intervals rejected; unmapped vendor rows reported |
+| Trading calendar (`calendar.py`): NYSE sessions, rebalance dates | ✅ `exchange_calendars` XNYS |
+| Corporate actions (`corporate_actions.py`): total returns, delisting returns | ✅ split/dividend factors from raw prices; delisting return compounded once (−30% fallback for performance delistings) |
 | In-house ADV₂₀ (raw close × raw volume, min 20 obs) | ✅ |
-| ClickHouse tick/bar loader | ✅ optional backend (`[clickhouse]` extra); daily bars keyed by New York session date |
-| Security master / `security_id` | 🟡 universe keyed on `security_id`; ticker/GICS history table still to build |
-| Trading calendar | ❌ sessions currently inferred from the price panel's dates |
-| Corporate actions, total returns, delisting returns | ❌ |
-| Parquet `DataStore` | ❌ |
-| Snapshots + manifests | ❌ |
-| Data-quality report | 🟡 exclusion reasons available; full report not built |
+| Universe (`universe.py`): PIT membership, staleness in sessions, vectorized | ✅ NaN prices treated as missing, duplicate rows rejected, stale market cap treated as missing |
+| `DataStore` protocol + `ParquetStore` (`store.py`) | ✅ partitioned by year, write-then-swap; `ClickHouseStore` not built (optional) |
+| Snapshots + manifests (`snapshot.py`) | ✅ content-addressed; input hashes, params, vendor, code revision; hash verified on load |
+| Data-quality report (`quality.py`) | ✅ coverage, missing bars, duplicates, off-session rows, bad prices, suspicious returns, split-day volume, membership gaps, stale exclusions |
+| ClickHouse tick/bar loader | ✅ optional backend (`[clickhouse]` extra); bounds read as New York time and sent as UTC |
 
 **Fixes to existing code**
 
@@ -177,7 +178,7 @@ Reproducible point-in-time universe snapshots with manifests, a total-return pan
 - [x] Vectorize `build_panel` (single cross-join + `join_asof` pass instead of a per-date loop).
 - [x] Align `LiquidityFilter` defaults with this roadmap (`adv_floor=25e6`, `price_floor=5.0`, no default market-cap floor).
 - [x] `ClickHouseLoader`: bind symbols as `{symbols:Array(String)}` instead of string-escaping.
-- [x] Key daily bars by session date; resample ticks using exchange-local (New York) dates. Regular-hours filtering waits for the calendar.
+- [x] Key daily bars by session date; resample ticks using exchange-local (New York) dates. Tick bars still include pre/post-market trades (regular-hours filter is a follow-up).
 - [x] Add `pyproject.toml` with optional extras (`[clickhouse]`, `[report]`, `[hawkes]`, `[dev]`); drop `tick` from core requirements.
 
 ---
