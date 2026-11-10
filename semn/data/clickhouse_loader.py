@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from typing import Optional, Protocol, Sequence
 
 import polars as pl
@@ -80,10 +81,6 @@ _FREQ_ALIASES: dict[str, str] = {
     "15min": "15m",
     "30t": "30m",
     "30min": "30m",
-    "1h": "1h",
-    "4h": "4h",
-    "1d": "1d",
-    "1w": "1w",
 }
 
 
@@ -216,8 +213,8 @@ class ClickHouseLoader:
                 side
             FROM {self._ticks_table}
             WHERE has({{symbols:Array(String)}}, symbol)
-              AND ts >= {{start:DateTime64}}
-              AND ts  < {{end:DateTime64}}
+              AND ts >= {{start:DateTime64(6, 'UTC')}}
+              AND ts  < {{end:DateTime64(6, 'UTC')}}
             ORDER BY symbol, ts
         """
         params = {
@@ -295,8 +292,8 @@ class ClickHouseLoader:
             FROM {self._bars_table}
             WHERE has({{symbols:Array(String)}}, symbol)
               AND freq   = {{freq:String}}
-              AND ts    >= {{start:DateTime64}}
-              AND ts     < {{end:DateTime64}}
+              AND ts    >= {{start:DateTime64(6, 'UTC')}}
+              AND ts     < {{end:DateTime64(6, 'UTC')}}
             ORDER BY symbol, ts
         """
         params = {
@@ -347,11 +344,11 @@ class ClickHouseLoader:
 
         # Truncate in exchange-local time so a "1d" bar is one New York session date,
         # not a UTC midnight-to-midnight window that splits the evening.
-        # shortcut: includes pre/post-market ticks; filter to regular hours once calendar.py exists.
+        # shortcut: includes pre/post-market ticks; clip to calendar open/close when tick data (D3) is in use.
         bar_local = (
             pl.col("ts")
             .dt.convert_time_zone(EXCHANGE_TZ)
-            .dt.truncate(_to_polars_duration(freq))
+            .dt.truncate(_normalise_freq(freq))
         )
         bars = (
             tick_df
@@ -409,25 +406,20 @@ class ClickHouseLoader:
 # ---------------------------------------------------------------------------
 
 def _parse_dt(value: str | datetime) -> datetime:
-    """Parse an ISO-8601 string or passthrough a datetime, always UTC-aware."""
-    if isinstance(value, datetime):
-        if value.tzinfo is None:
-            return value.replace(tzinfo=timezone.utc)
-        return value
-    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    """
+    Parse to a UTC datetime.  Values without a time zone are New York time, so
+    ``"2024-01-02"`` means the start of that session date, not 19:00 the day before.
+    """
+    dt = value if isinstance(value, datetime) else datetime.fromisoformat(value.replace("Z", "+00:00"))
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
+        dt = dt.replace(tzinfo=ZoneInfo(EXCHANGE_TZ))
+    return dt.astimezone(timezone.utc)
 
 
 def _normalise_freq(freq: str) -> str:
     """Normalise a user-supplied frequency string to the canonical form stored in ClickHouse."""
     return _FREQ_ALIASES.get(freq.lower(), freq.lower())
 
-
-def _to_polars_duration(freq: str) -> str:
-    """Convert a frequency string to a Polars ``dt.truncate`` duration (same aliases as storage)."""
-    return _normalise_freq(freq)
 
 
 def _cast_to_schema(

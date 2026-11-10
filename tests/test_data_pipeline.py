@@ -30,7 +30,6 @@ from semn.data.clickhouse_loader import (
     ClickHouseLoader,
     _normalise_freq,
     _parse_dt,
-    _to_polars_duration,
 )
 from semn.data.universe import (
     ADV_WINDOW,
@@ -398,8 +397,12 @@ def _make_mcap(rows: list[tuple]) -> pl.DataFrame:
     })
 
 
+#: Business days standing in for NYSE sessions in these synthetic fixtures.
+ALL_SESSIONS = pl.Series("date", _sessions(400, end=date(2024, 6, 28)), dtype=pl.Date)
+
+
 def _builder(members: list[tuple], prices: list[pl.DataFrame], mcap: list[tuple] = ()) -> UniverseBuilder:
-    return UniverseBuilder(_make_membership(members), pl.concat(prices), _make_mcap(list(mcap)))
+    return UniverseBuilder(_make_membership(members), pl.concat(prices), _make_mcap(list(mcap)), ALL_SESSIONS)
 
 
 ACTIVE = ("2020-01-01", "9999-12-31")
@@ -409,7 +412,7 @@ class TestUniverseBuilderInit:
     def test_missing_membership_col_raises(self):
         bad = pl.DataFrame({"security_id": [], "index": []})  # missing entry/exit date
         with pytest.raises(ValueError, match="membership_df"):
-            UniverseBuilder(bad, _history("A", 10.0), _make_mcap([]))
+            UniverseBuilder(bad, _history("A", 10.0), _make_mcap([]), ALL_SESSIONS)
 
     def test_price_without_volume_raises(self):
         """ADV is computed in-house, so raw volume is required."""
@@ -418,7 +421,13 @@ class TestUniverseBuilderInit:
                 _make_membership([("A", "SP500", *ACTIVE)]),
                 _history("A", 10.0).drop("volume"),
                 _make_mcap([]),
+                ALL_SESSIONS,
             )
+
+    def test_duplicate_price_rows_raise(self):
+        """Duplicates would let 10 real days pass the 20-observation ADV history check."""
+        with pytest.raises(ValueError, match="duplicate"):
+            _builder([("A", "SP500", *ACTIVE)], [_history("A", 10.0), _history("A", 10.0)])
 
 
 # ---------------------------------------------------------------------------
@@ -473,6 +482,39 @@ class TestUniverseBuilderBuild:
         b = _builder([("NOCAP", "SP500", *ACTIVE)], [_history("NOCAP", 10.0)])
         assert b.build(AS_OF)["security_id"].to_list() == ["NOCAP"]
         assert b.build(AS_OF, mcap_floor=1.0).is_empty()
+
+    def test_nan_close_is_missing_not_eligible(self):
+        """NaN compares above every number in Polars; it must not pass the price floor."""
+        close = [50.0] * (ADV_WINDOW - 1) + [float("nan")]
+        b = _builder([("X", "SP500", *ACTIVE)], [_history("X", close, 1e7)])
+        assert b.build(AS_OF, **LiquidityFilter().as_kwargs()).is_empty()
+        assert b.exclusions([AS_OF])["exclusion"].to_list() == ["no_data"]
+
+    def test_index_none_returns_each_security_once(self):
+        b = _builder(
+            [("X", "SP500", *ACTIVE), ("X", "R1000", *ACTIVE)],
+            [_history("X", 50.0)],
+        )
+        result = b.build(AS_OF)
+        assert result.select("security_id", "index").rows() == [("X", "R1000")]
+
+    def test_stale_market_cap_is_treated_as_missing(self):
+        b = _builder(
+            [("X", "SP500", *ACTIVE)], [_history("X", 50.0)],
+            [("2023-12-22", "X", 5e10)],  # 7 sessions before AS_OF
+        )
+        assert b.build(AS_OF)["market_cap"].to_list() == [None]
+        assert b.build(AS_OF, mcap_floor=1e9).is_empty()
+        fresh = _builder(
+            [("X", "SP500", *ACTIVE)], [_history("X", 50.0)],
+            [("2023-12-26", "X", 5e10)],  # exactly 5 sessions before AS_OF
+        )
+        assert fresh.build(AS_OF)["market_cap"].to_list() == [5e10]
+
+    def test_rebalance_after_last_session_raises(self):
+        b = _builder([("X", "SP500", *ACTIVE)], [_history("X", 50.0)])
+        with pytest.raises(ValueError, match="last session"):
+            b.build(date(2030, 1, 2))
 
     def test_index_filter(self):
         b = _builder(
@@ -617,16 +659,34 @@ class TestUtilityHelpers:
 
     def test_parse_dt_passthrough(self):
         now = datetime(2024, 1, 1, tzinfo=timezone.utc)
-        assert _parse_dt(now) is now
+        assert _parse_dt(now) == now
+
+    def test_parse_dt_naive_is_new_york(self):
+        """A date-only bound is the start of the New York session date (05:00 UTC in winter)."""
+        assert _parse_dt("2024-01-02") == datetime(2024, 1, 2, 5, 0, tzinfo=timezone.utc)
+
+    def test_parse_dt_other_zone_converted_to_utc(self):
+        """16:00 Tokyo is 07:00 UTC; sending the wall clock "16:00" would leak 9 hours of future data."""
+        from zoneinfo import ZoneInfo
+        tokyo = datetime(2024, 1, 2, 16, 0, tzinfo=ZoneInfo("Asia/Tokyo"))
+        assert _parse_dt(tokyo) == datetime(2024, 1, 2, 7, 0, tzinfo=timezone.utc)
+
+    def test_pit_cutoff_sent_as_utc(self):
+        from zoneinfo import ZoneInfo
+        mock_client = _make_mock_client(_tick_pandas(n=3))
+        ClickHouseLoader(client=mock_client).get_tick_data(
+            ["AAPL"], "2024-01-02", "2024-01-03",
+            pit_cutoff=datetime(2024, 1, 2, 16, 0, tzinfo=ZoneInfo("Asia/Tokyo")),
+        )
+        sql = mock_client.query_df.call_args[0][0]
+        assert mock_client.query_df.call_args[1]["parameters"]["end"] == "2024-01-02 07:00:00"
+        assert "DateTime64(6, 'UTC')" in sql
 
     def test_normalise_freq(self):
         assert _normalise_freq("1T") == "1m"
         assert _normalise_freq("5min") == "5m"
         assert _normalise_freq("1D") == "1d"
 
-    def test_to_polars_duration(self):
-        assert _to_polars_duration("1d") == "1d"
-        assert _to_polars_duration("5T") == "5m"
 
     def test_parse_date_string(self):
         d = _parse_date("2024-03-15")

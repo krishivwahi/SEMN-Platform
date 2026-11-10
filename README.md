@@ -16,7 +16,8 @@ semn-platform/
 ├── ROADMAP.md              # Engineering roadmap (v2)
 ├── src/core/               # High-performance C++20 execution core
 ├── semn/
-│   ├── data/               # Data pipeline & universe construction
+│   ├── data/               # Phase 1: calendar, security master, corporate actions,
+│   │                       #   Parquet store, PIT universe, snapshots, data-quality report
 │   ├── factors/            # Risk modelling
 │   ├── alpha/              # Signal generation
 │   ├── optimizer/          # Portfolio construction
