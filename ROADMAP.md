@@ -6,7 +6,7 @@
 | | |
 |---|---|
 | **Timeline** | ~19 weeks (4.5 months) for the core platform; stretch tracks are extra |
-| **Current status** | Phase 1 complete on free data (D1 interim). Phase 2 needs a GICS / market-cap source. See [Phase 1 status](#phase-1-status) |
+| **Current status** | Phase 1 complete on free data (D1 interim). Phase 2 core modelling built; size, value and sectors need a data source. See [Phase 2 status](#phase-2-status) |
 
 ---
 
@@ -204,6 +204,19 @@ Built and tested. The vendor adapter uses the interim free sources (D1 above); e
   residuals uncorrelated with exposures by construction; out-of-sample risk forecast bias statistic ≈ 1.
 
 **Deliverable:** factor exposure panel, factor and residual returns, covariance diagnostics.
+
+### Phase 2 status
+
+| Item | Status |
+|---|---|
+| Beta (vs SPY), momentum 12-1, reversal, volatility (`exposures.py`) | ✅ point-in-time; tested for exact windows and no look-ahead |
+| Standardization (winsorize, cap-weighted mean 0, unit std) | ✅ |
+| Cross-sectional WLS, factor returns + residuals (`risk_model.py`) | ✅ recovers known factor returns; residuals weighted-orthogonal to exposures |
+| Σ = XFXᵀ + D, Ledoit–Wolf baseline, diagnostics, bias statistic (`covariance.py`) | ✅ Ledoit–Wolf matches scikit-learn; bias statistic ≈ 1 out of sample on simulated data |
+| SPY benchmark in the data download | ✅ |
+| Size, value, GICS sectors | ⏸ code accepts market cap and sector inputs; needs a data source (SEC EDGAR: shares outstanding, filing dates) |
+| RMT (Marchenko–Pastur) denoising | ❌ optional |
+| Run on real data | ❌ needs the Tiingo download (D1) |
 
 ---
 

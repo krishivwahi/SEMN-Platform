@@ -56,6 +56,8 @@ from semn.data.store import ParquetStore
 TICKERS_URL = "https://apimedia.tiingo.com/docs/tiingo/daily/supported_tickers.zip"
 PRICES_URL = "https://api.tiingo.com/tiingo/daily/{ticker}/prices?startDate={start}&endDate={end}&format=csv"
 FAR = sp500_github.FAR
+#: Market proxy for beta (Phase 2).
+BENCHMARK = "SPY"
 #: A listing whose last price is within this many days of the newest one is still trading.
 ACTIVE_LAG_DAYS = 7
 
@@ -151,6 +153,7 @@ def primary_listings(listings: pl.DataFrame) -> pl.DataFrame:
         listings.sort("ticker", "active", "start_date")
         .group_by("ticker", maintain_order=True)
         .last()
+        .select(listings.columns)
     )
 
 
@@ -368,7 +371,9 @@ def ingest(
     Build every raw Phase 1 table for S&P 500 members active in ``[start, end]``.
 
     Writes ``tickers, membership, unmapped_membership, rename_suggestions, prices,
-    splits, dividends, delistings`` to *store* and returns their row counts.
+    splits, dividends, delistings, benchmark`` to *store* and returns their row counts.
+    The benchmark (SPY, for market beta) is priced alongside the members; it is not an
+    index member, so it never enters the universe.
     """
     cache = Path(cache_dir)
     listings = load_listings(download(TICKERS_URL, cache / "supported_tickers.zip", http_get))
@@ -379,11 +384,14 @@ def ingest(
     in_window = reference["membership"].filter(
         (pl.col("entry_date") <= date.fromisoformat(end)) & (pl.col("exit_date") > date.fromisoformat(start))
     )
-    used = listings.join(in_window.select("security_id").unique(), on="security_id")
+    benchmark = primary_listings(listings).filter(pl.col("ticker") == BENCHMARK)
+    if benchmark.is_empty():
+        raise RuntimeError(f"benchmark {BENCHMARK} is not in the vendor's ticker list")
+    used = pl.concat([listings.join(in_window.select("security_id").unique(), on="security_id"), benchmark]).unique("security_id")
     fetch_prices(used["ticker"].unique().sort().to_list(), start, end, api_key, cache / "tiingo",
                  requests_per_hour, http_get)
 
-    tables = {**reference, **price_tables(used, cache / "tiingo")}
+    tables = {**reference, **price_tables(used, cache / "tiingo"), "benchmark": benchmark.select("security_id")}
     for name, df in tables.items():
         store.write(name, df)
     return {name: df.height for name, df in tables.items()}

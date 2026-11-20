@@ -33,6 +33,7 @@ BBB,NASDAQ,ETF,USD,2022-11-01,2024-06-28
 META,NASDAQ,Stock,USD,2012-05-18,2024-06-28
 FB,BATS,ETF,USD,2024-01-02,2024-06-28
 BRK.B,NYSE,Stock,USD,1996-05-09,2024-06-28
+SPY,NYSE ARCA,ETF,USD,1993-01-29,2024-06-28
 VFIAX,NMFQS,Mutual Fund,USD,2000-11-13,2024-06-28
 000001,SHE,Stock,CNY,2007-01-04,2024-06-28
 """
@@ -71,7 +72,7 @@ class TestMembership:
 class TestListings:
     def test_keeps_any_exchange_and_asset_type_but_not_funds_or_foreign(self, tmp_path):
         listings = tiingo.load_listings(_write(tmp_path, "st.csv", LISTINGS_CSV))
-        assert set(listings["ticker"]) == {"AAA", "BBB", "META", "FB", "BRK-B"}
+        assert set(listings["ticker"]) == {"AAA", "BBB", "META", "FB", "BRK-B", "SPY"}
         assert listings.filter(pl.col("ticker") == "BBB")["security_id"].to_list() == ["BBB@2015-01-02", "BBB@2022-11-01"]
         assert listings.filter(~pl.col("active"))["security_id"].to_list() == ["BBB@2015-01-02"]
 
@@ -81,7 +82,7 @@ class TestListings:
             z.writestr("supported_tickers.csv", LISTINGS_CSV)
         path = tmp_path / "st.zip"
         path.write_bytes(buf.getvalue())
-        assert tiingo.load_listings(path).height == 6
+        assert tiingo.load_listings(path).height == 7
 
 
 class TestReference:
@@ -206,11 +207,13 @@ def test_ingest_end_to_end(tmp_path):
         "/AAA/": (200, history(50.0)),
         "/META/": (200, history(300.0)),
         "/BBB/": (200, history(40.0)),
+        "/SPY/": (200, history(450.0)),
     })
     store = ParquetStore(tmp_path / "store")
     counts = tiingo.ingest(store, "k", "2022-01-03", "2023-03-31", tmp_path / "cache", 10**9, http,
                            renames=RENAMES)
     assert counts["prices"] > 0 and counts["unmapped_membership"] == 1
+    assert store.scan("benchmark").collect()["security_id"].to_list() == ["SPY@1993-01-29"]
 
     tables = {n: store.scan(n).collect() for n in ("membership", "prices")}
     builder = UniverseBuilder(tables["membership"], tables["prices"],

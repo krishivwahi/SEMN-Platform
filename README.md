@@ -5,7 +5,8 @@ point-in-time data → factor risk model → cross-sectional ranking → portfol
 validation (CPCV, Deflated Sharpe Ratio) → tear-sheet. Python and Polars; a C++20
 execution core is planned for Phase 6. Full plan and status: [ROADMAP.md](ROADMAP.md).
 
-**Status:** Phase 1 (point-in-time data layer) is complete. Phase 2 (factor risk model) is in progress.
+**Status:** Phase 1 (point-in-time data layer) is complete. Phase 2 (factor risk model) is in progress:
+exposures, the cross-sectional regression and the risk estimates are built and tested on simulated data.
 
 ## What Phase 1 does
 
@@ -38,6 +39,10 @@ semn/data/
 ├── snapshot.py            content-hashed snapshots + manifests
 ├── clickhouse_loader.py   optional ClickHouse tick/bar backend
 └── sources/               free vendor adapter (Tiingo prices, S&P 500 membership)
+semn/factors/
+├── exposures.py           beta, momentum, reversal, volatility; standardization
+├── risk_model.py          cross-sectional WLS: factor returns and residuals
+└── covariance.py          XFXᵀ + D, Ledoit–Wolf, diagnostics, bias statistic
 tests/                     offline tests; no network or API key needed
 ```
 
@@ -45,7 +50,7 @@ tests/                     offline tests; no network or API key needed
 
 ```bash
 pip install -e ".[dev]"
-pytest                      # 94 tests
+pytest                      # 109 tests
 ```
 
 Download the free data (key from tiingo.com; the free tier allows 50 requests/hour, so a
