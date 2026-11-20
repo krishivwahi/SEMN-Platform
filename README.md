@@ -1,55 +1,59 @@
 # SEMN — Systematic Equity Research Platform
 
-[![Language: C++20](https://img.shields.io/badge/Language-C%2B%2B20-blue.svg)](#)
-[![Language: Python 3.11+](https://img.shields.io/badge/Language-Python%203.11%2B-blue.svg)](#)
+A research platform for **market-neutral US equity strategies**, built phase by phase:
+point-in-time data → factor risk model → cross-sectional ranking → portfolio optimizer →
+validation (CPCV, Deflated Sharpe Ratio) → tear-sheet. Python and Polars; a C++20
+execution core is planned for Phase 6. Full plan and status: [ROADMAP.md](ROADMAP.md).
 
-A high-performance quantitative research and execution platform for systematic equity strategies.
+**Status:** Phase 1 (point-in-time data layer) is complete. Phase 2 (factor risk model) is in progress.
 
----
+## What Phase 1 does
 
-## Repository Layout
+- **Survivorship-bias-free S&P 500 universe.** Index membership is applied point in time
+  (`entry ≤ t < exit`), including companies that were later acquired or delisted.
+- **Permanent security IDs.** Every row is keyed by `security_id`, never by ticker, so ticker
+  changes (FB → META) and reused tickers (MRNA before and after Moderna) cannot mix two companies.
+- **Raw prices only.** The $5 price floor and 20-day dollar volume use what actually traded that day;
+  total returns are built from raw prices plus splits, dividends and delisting returns.
+- **NYSE calendar.** Staleness and windows are counted in real trading sessions.
+- **Reproducible snapshots.** Each universe build is saved under a hash of its contents, with a
+  manifest of input-file hashes, parameters and code revision; the hash is checked on load.
+- **Data-quality report.** Coverage, missing bars, duplicates, bad prices, unexplained
+  >50% moves, split-day volume and membership gaps.
+
+On the free data sources, 85% (2010) to 99.6% (2024) of historical S&P 500 members map to a
+security with prices; the rest are listed in an `unmapped_membership` report. Known gaps of free
+data (no delisting returns, no GICS history) are recorded under D1 in the roadmap.
+
+## Layout
 
 ```
-semn-platform/
-├── CMakeLists.txt          # C++20 build config
-├── pyproject.toml          # Python package + extras: [clickhouse], [report], [hawkes], [dev]
-├── ROADMAP.md              # Engineering roadmap (v2)
-├── src/core/               # High-performance C++20 execution core
-├── semn/
-│   ├── data/               # Phase 1: calendar, security master, corporate actions,
-│   │                       #   Parquet store, PIT universe, snapshots, data-quality report
-│   ├── factors/            # Risk modelling
-│   ├── alpha/              # Signal generation
-│   ├── optimizer/          # Portfolio construction
-│   ├── evaluation/         # Validation framework
-│   └── reporting/          # Performance reporting
-└── tests/
+semn/data/
+├── calendar.py            NYSE sessions, rebalance dates
+├── security_master.py     security_id with dated ticker and GICS history
+├── corporate_actions.py   total returns, delisting returns
+├── universe.py            point-in-time universe and exclusion report
+├── quality.py             data-quality report
+├── store.py               Parquet store (year partitions)
+├── snapshot.py            content-hashed snapshots + manifests
+├── clickhouse_loader.py   optional ClickHouse tick/bar backend
+└── sources/               free vendor adapter (Tiingo prices, S&P 500 membership)
+tests/                     offline tests; no network or API key needed
 ```
 
----
-
-## Stack
-
-- **Python 3.11+** — research, modelling, data pipeline
-- **C++20** — execution core, exposed to Python via pybind11
-- **ClickHouse** (optional) — columnar market data storage
-- **Polars / PyArrow** — high-performance dataframe operations
-
-## Install
+## Run
 
 ```bash
-pip install -e ".[dev]"            # core + tests
-pip install -e ".[clickhouse]"     # optional ClickHouse backend
+pip install -e ".[dev]"
+pytest                      # 94 tests
 ```
 
-## Data
-
-Free S&P 500 data (Tiingo end-of-day prices + historical membership); get a free key at tiingo.com:
+Download the free data (key from tiingo.com; the free tier allows 50 requests/hour, so a
+2010+ build takes about 15 hours and resumes where it stopped):
 
 ```bash
 export TIINGO_API_KEY=...
 python -m semn.data.sources.tiingo --start 2010-01-01 --root data/store --cache data/cache
 ```
 
-Downloads are cached and resume after the free tier's rate limit. Vendor data stays in `data/`
-(git-ignored). Coverage and known gaps: see D1 in [ROADMAP.md](ROADMAP.md).
+Vendor data stays in `data/`, which is git-ignored (Tiingo's terms forbid redistribution).

@@ -1,28 +1,12 @@
-# SEMN Engineering Roadmap — v2
+# SEMN Engineering Roadmap
 
 > **Core principle:** SEMN is not a trading app. It is a research and execution system for
 > **cross-sectional, market-neutral** equity strategy evaluation.
->
-> **Daily question:** *"Am I improving strategy validity, or just adding features?"*
 
 | | |
 |---|---|
-| **Version** | v2 (2026-11-10) — supersedes the original 7-phase PDF roadmap |
 | **Timeline** | ~19 weeks (4.5 months) for the core platform; stretch tracks are extra |
 | **Current status** | Phase 1 complete on free data (D1 interim). Phase 2 needs a GICS / market-cap source. See [Phase 1 status](#phase-1-status) |
-
----
-
-## What changed from v1
-
-1. **Data source is now an explicit Phase 1 decision.** Every later phase (fundamentals, GICS history, tick data) depends on it.
-2. **End-to-end thin slice before C++.** A Python reference backtester (needed anyway for parity tests) ships with the optimizer; the C++20 core moves later as a performance/parity phase.
-3. **Hawkes order-flow and Level-2 replay moved to stretch tracks.** Daily OHLCV cannot support them; they need tick/L2 data.
-4. **Risk parameters reconciled.** Gross exposure is the *output* of volatility targeting (with a cap); drawdown thresholds are volatility-relative and have a re-entry rule; factor-exposure limits apply to standardized exposures.
-5. **Targets recalibrated.** The "net Sharpe > 2.0" target is replaced with process-based acceptance criteria (DSR, CPCV distribution). ICIR now states its period.
-6. **Experiment tracking starts in Phase 1**, not Phase 6 — data snapshots are hashed from day one.
-7. **Universe scoped to S&P 500** (S&P 1500 optional if the vendor supports it). Russell 1000 history is dropped unless affordable data is found.
-8. **Securities keyed by a permanent `security_id`**, never by ticker.
 
 ---
 
@@ -42,17 +26,17 @@ Point-in-Time Data ─► Factor Risk Model ─► Cross-Sectional Alpha ─► 
 
 Python orchestrates research; pybind11 (or nanobind) connects Python to the C++20 execution core.
 
-## Architectural transition matrix
+## Design targets
 
-| Dimension | Legacy build | SEMN target |
-|---|---|---|
-| Universe | Single asset (SPY or BTC-USD) | Point-in-time S&P 500 constituents (S&P 1500 optional) keyed by `security_id` |
-| Exposure | Directional long/flat | Dollar-neutral (Σwᵢ = 0) and beta-neutral (Σwᵢβᵢ = 0) |
-| Risk | Static sizing; post-hoc drawdown | Barra-style factor neutralization; Ledoit–Wolf / RMT covariance; vol-relative drawdown controls |
-| Execution | $1 commission; static 5 bps slippage | Almgren–Chriss impact, participation caps, borrow & financing |
-| Alpha | Directional triple-barrier XGBoost | LightGBM LambdaMART ranking on residual returns (Hawkes = stretch) |
-| Validation | Rolling walk-forward; embargo | CPCV, Deflated Sharpe Ratio, AUM capacity curves |
-| Systems | Python, CSV, Spring Boot, React | Python + Polars/Parquet; C++20 + pybind11; ClickHouse optional; automated PDF dossier |
+| Dimension | Target |
+|---|---|
+| Universe | Point-in-time S&P 500 constituents keyed by a permanent `security_id` |
+| Exposure | Dollar-neutral (Σwᵢ = 0) and beta-neutral (Σwᵢβᵢ = 0) |
+| Risk | Barra-style factor neutralization; Ledoit–Wolf / RMT covariance; vol-relative drawdown controls |
+| Execution | Almgren–Chriss impact, participation caps, borrow & financing |
+| Alpha | Ranking models (LambdaMART) on factor-residual returns |
+| Validation | CPCV, Deflated Sharpe Ratio, AUM capacity curves |
+| Systems | Python + Polars/Parquet; C++20 execution core (Phase 6); automated PDF dossier |
 
 ---
 
@@ -302,7 +286,7 @@ net performance degrades monotonically as participation rises from 1% to 15% of 
 - **Experiment ledger:** extends the Phase 1 manifests — data snapshot hash, feature set, model params,
   code revision, seeds, costs, windows, outputs. Every run is logged; no cherry-picking.
 
-**Acceptance criteria (replace the v1 Sharpe target):**
+**Acceptance criteria:**
 DSR > 0.95; median CPCV path Sharpe > 0 with a stated share of positive paths; results survive realistic costs at
 the chosen AUM; residual exposures within limits. A net Sharpe of roughly 0.5–1.5 on this universe and data
 with these checks passing is a credible outcome.
@@ -353,9 +337,8 @@ with these checks passing is a credible outcome.
 ```
 Live-Algorithmic-Trading-Platform/
 ├── pyproject.toml              # extras: [clickhouse], [report], [hawkes], [dev]
-├── CMakeLists.txt
 ├── ROADMAP.md
-├── src/core/                   # C++20: engine.cpp, impact_model.cpp, bindings.cpp
+├── src/core/                   # C++20 (Phase 6): engine, impact model, bindings
 ├── semn/
 │   ├── data/                   # Phase 1 (see layout above)
 │   ├── factors/                # risk_model.py, covariance.py
@@ -369,12 +352,6 @@ Live-Algorithmic-Trading-Platform/
 ```
 
 ---
-
-## Interview talking points
-
-- **Why the backtest is realistic:** next-bar fills, calibrated impact, borrow and financing, raw-price universe filters, delisting returns, no lookahead.
-- **Why the ML is valid:** point-in-time features with filing dates, residual-return labels, purge/embargo, CPCV, DSR with an honest trial count.
-- **Why the strategy matters:** factor and beta neutrality, capacity analysis, regime and sector breakdowns, net-of-cost risk-adjusted metrics.
 
 ## Common failure points
 
