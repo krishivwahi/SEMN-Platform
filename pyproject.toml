@@ -28,3 +28,5 @@ include = ["semn*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# exchange_calendars itself triggers this pandas 3 deprecation; not our code.
+filterwarnings = ["ignore:Series.values returning an ndarray that drops timezone"]
